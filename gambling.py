@@ -1,14 +1,13 @@
 """
-Wheel of Tribes (Vegas Edition)
+Wheel of Tribes (Vegas Slot Machine Edition)
 A desktop Commander tribal randomizer: set up your table, roll each player a
-tribe + color identity, watch the wheel spin and land on it, reroll anyone
-who wants a new fate.
+tribe + color identity on a two-reel slot machine, reroll anyone who wants a
+new fate.
 
 Requires: requests   (pip install requests)
 Run:      python wheel_of_tribes.py
 """
 
-import math
 import os
 import queue
 import random
@@ -123,6 +122,7 @@ NEON_PINK = "#FF2DA0"
 NEON_CYAN = "#27E6E6"
 GREEN_OK = "#5CFF9D"
 RED_ERR = "#FF5D5D"
+REEL_DARK_TEXT = "#0A0A0F"
 
 ROLL_TIMEOUT_SECONDS = 10
 HEADERS = {
@@ -136,9 +136,31 @@ def identity_name(colors):
     return COLOR_IDENTITY_NAMES.get(key, "/".join(key) if key else "Colorless")
 
 
+def _hex_to_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb):
+    return "#%02X%02X%02X" % rgb
+
+
+def identity_color(colors):
+    """Blend each color's swatch hex into one representative color for a combo."""
+    rgbs = [_hex_to_rgb(COLOR_HEX[c]) for c in colors]
+    avg = tuple(sum(ch) // len(ch) for ch in zip(*rgbs))
+    return _rgb_to_hex(avg)
+
+
+# Precompute every identity entry once: (label, swatch color)
+ALL_IDENTITIES = [
+    (identity_name(key), identity_color(key)) for key in COLOR_IDENTITY_NAMES
+]
+
 # ---------------------------------------------------------------------------
 # Invalid combo cache (persisted to disk, just like the original script)
 # ---------------------------------------------------------------------------
+
 
 def load_invalid_combos():
     if not os.path.exists(INVALID_FILE):
@@ -230,92 +252,145 @@ def roll_worker(player_id, result_queue):
 
 
 # ---------------------------------------------------------------------------
-# Wheel widget
+# Slot reel widget
 # ---------------------------------------------------------------------------
 
-class WheelCanvas(tk.Canvas):
-    def __init__(self, parent, size=340, **kwargs):
-        super().__init__(parent, width=size, height=size, bg=BG_VOID,
+class SlotReel(tk.Canvas):
+    """A single vertically-scrolling slot reel. Items scroll downward and the
+    payline (middle row) shows whatever has landed there."""
+
+    ROW_H = 48
+    VISIBLE_ROWS = 3
+
+    def __init__(self, parent, width=230, default_fg=PARCHMENT, **kwargs):
+        height = self.ROW_H * self.VISIBLE_ROWS
+        super().__init__(parent, width=width, height=height, bg="#0C0C12",
                           highlightthickness=0, **kwargs)
-        self.size = size
-        self.cx = size / 2
-        self.cy = size / 2
-        self.r = size / 2 - 24
-        self.rotation = 0.0
-        self.n = len(TRIBES)
-        self.palette = [COLOR_HEX["W"], COLOR_HEX["U"], COLOR_HEX["B"], COLOR_HEX["R"], COLOR_HEX["G"]]
-        self._bulb_phase = 0
+        self.width_px = width
+        self.default_fg = default_fg
+        self.strip = []      # list of (text, bg_hex_or_None)
+        self.cyclic = True
+        self.scroll_pos = 0.0
+        self._render()
+
+    def set_strip(self, items, cyclic):
+        self.strip = items
+        self.cyclic = cyclic
+        self._render()
+
+    def set_scroll(self, pos):
+        self.scroll_pos = pos
+        self._render()
+
+    def _item_at(self, index):
+        if not self.strip:
+            return ("", None)
+        if self.cyclic:
+            return self.strip[index % len(self.strip)]
+        if 0 <= index < len(self.strip):
+            return self.strip[index]
+        return ("", None)
+
+    def _render(self):
+        self.delete("all")
+        row_h = self.ROW_H
+        base_index = int(self.scroll_pos // row_h)
+        offset = self.scroll_pos % row_h
+
+        for visual_row in range(-1, self.VISIBLE_ROWS + 1):
+            idx = base_index + visual_row
+            text, bg = self._item_at(idx)
+            y_top = visual_row * row_h - offset
+            y_bottom = y_top + row_h
+            if bg:
+                self.create_rectangle(1, y_top, self.width_px - 1, y_bottom, fill=bg, outline="")
+                fg = REEL_DARK_TEXT
+            else:
+                fg = self.default_fg
+            if text:
+                font_size = 12 if len(text) <= 14 else 10
+                self.create_text(self.width_px / 2, (y_top + y_bottom) / 2, text=text,
+                                  fill=fg, font=("Georgia", font_size, "bold"))
+
+        # dim the top/bottom rows, highlight the payline
+        self.create_rectangle(0, 0, self.width_px, row_h, fill="", outline="")
+        self.create_rectangle(0, 0, self.width_px, row_h, stipple="gray50", fill=BG_VOID, outline="")
+        self.create_rectangle(0, row_h * 2, self.width_px, row_h * 3, stipple="gray50", fill=BG_VOID, outline="")
+        self.create_rectangle(2, row_h, self.width_px - 2, row_h * 2, outline=NEON_CYAN, width=2)
+
+
+class SlotMachine(ttk.Frame):
+    """Two-reel cabinet: tribe reel on the left, color-identity reel on the right."""
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, style="Cabinet.TFrame", padding=16, **kwargs)
+
         self._bulb_ids = []
-        self._draw()
-        self._draw_bulbs()
-        self._draw_pointer()
+        self._bulb_phase = 0
+        self.bulb_canvas = tk.Canvas(self, height=18, bg=BG_VOID, highlightthickness=0)
+        self.bulb_canvas.pack(fill="x", pady=(0, 10))
+        self._build_bulbs()
+
+        reels_row = ttk.Frame(self, style="Cabinet.TFrame")
+        reels_row.pack()
+
+        left_col = ttk.Frame(reels_row, style="Cabinet.TFrame")
+        left_col.grid(row=0, column=0, padx=(0, 6))
+        ttk.Label(left_col, text="TRIBE", style="ReelLabel.TLabel").pack(pady=(0, 4))
+        self.tribe_reel = SlotReel(left_col, width=230)
+        self.tribe_reel.pack()
+
+        arrow_col = ttk.Frame(reels_row, style="Cabinet.TFrame")
+        arrow_col.grid(row=0, column=1, padx=4)
+        ttk.Label(arrow_col, text="", style="Cabinet.TLabel").pack(pady=(0, 4))
+        ttk.Label(arrow_col, text="\u25B6", style="Arrow.TLabel").pack(pady=(SlotReel.ROW_H - 10, 0))
+
+        right_col = ttk.Frame(reels_row, style="Cabinet.TFrame")
+        right_col.grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(right_col, text="COLOR IDENTITY", style="ReelLabel.TLabel").pack(pady=(0, 4))
+        self.identity_reel = SlotReel(right_col, width=230)
+        self.identity_reel.pack()
+
+        bottom_bulbs = tk.Canvas(self, height=18, bg=BG_VOID, highlightthickness=0)
+        bottom_bulbs.pack(fill="x", pady=(10, 0))
+        self._bottom_bulb_canvas = bottom_bulbs
+        self._bottom_bulb_ids = []
+        self._build_bulbs(bottom_bulbs, self._bottom_bulb_ids)
+
         self._chase_bulbs()
 
-    def _draw(self):
-        self.delete("wedge")
-        seg = 360 / self.n
-        bbox = (self.cx - self.r, self.cy - self.r, self.cx + self.r, self.cy + self.r)
-        for i in range(self.n):
-            start = (self.rotation + i * seg) % 360
-            color = self.palette[i % len(self.palette)]
-            self.create_arc(
-                *bbox, start=start, extent=seg,
-                fill=color, outline="#0A0A0F", width=2,
-                style=tk.PIESLICE, tags="wedge",
-            )
-            mid_deg = start + seg / 2
-            mid_rad = math.radians(mid_deg)
-            tx = self.cx + (self.r * 0.62) * math.cos(mid_rad)
-            ty = self.cy - (self.r * 0.62) * math.sin(mid_rad)
-            text_angle = mid_deg if -90 <= ((mid_deg + 90) % 360) - 90 <= 90 else mid_deg + 180
-            try:
-                self.create_text(
-                    tx, ty, text=TRIBES[i], fill="#160F26",
-                    font=("Georgia", 9, "bold"), angle=text_angle, tags="wedge",
-                )
-            except tk.TclError:
-                self.create_text(tx, ty, text=TRIBES[i], fill="#160F26",
-                                  font=("Georgia", 8, "bold"), tags="wedge")
-        self.tag_raise("bulb")
-        self.tag_raise("pointer")
-        self.tag_raise("hub")
-
-    def _draw_bulbs(self):
-        self.delete("bulb")
-        bulb_count = 24
-        ring_r = self.r + 12
-        self._bulb_ids = []
-        for i in range(bulb_count):
-            ang = math.radians(i * (360 / bulb_count))
-            bx = self.cx + ring_r * math.cos(ang)
-            by = self.cy - ring_r * math.sin(ang)
-            bid = self.create_oval(bx - 4, by - 4, bx + 4, by + 4,
-                                    fill=GOLD, outline="", tags="bulb")
-            self._bulb_ids.append(bid)
+    def _build_bulbs(self, canvas=None, store=None):
+        canvas = canvas or self.bulb_canvas
+        store = store if store is not None else self._bulb_ids
+        canvas.delete("all")
+        store.clear()
+        canvas.update_idletasks()
+        w = canvas.winfo_width() or 520
+        spacing = 18
+        count = max(4, w // spacing)
+        for i in range(count):
+            x = i * spacing + 10
+            bid = canvas.create_oval(x - 4, 5, x + 4, 13, fill=GOLD, outline="")
+            store.append(bid)
 
     def _chase_bulbs(self):
-        n = len(self._bulb_ids)
-        if n:
-            for i, bid in enumerate(self._bulb_ids):
-                lit = (i + self._bulb_phase) % 6 == 0
-                self.itemconfig(bid, fill=NEON_PINK if lit else GOLD)
-            self._bulb_phase = (self._bulb_phase + 1) % n
-        self.after(120, self._chase_bulbs)
-
-    def _draw_pointer(self):
-        self.create_polygon(
-            self.cx - 13, 6, self.cx + 13, 6, self.cx, 30,
-            fill=NEON_CYAN, outline=GOLD_BRIGHT, width=1, tags="pointer",
-        )
-        self.create_oval(
-            self.cx - 42, self.cy - 42, self.cx + 42, self.cy + 42,
-            fill="#160F26", outline=GOLD, width=3, tags="hub",
-        )
-        self.create_text(self.cx, self.cy, text="\u2660", font=("Georgia", 24), fill=GOLD_BRIGHT, tags="hub")
-
-    def set_rotation(self, deg):
-        self.rotation = deg % 360
-        self._draw()
+        for canvas, store, phase_attr in (
+            (self.bulb_canvas, self._bulb_ids, "_bulb_phase"),
+        ):
+            n = len(store)
+            if n:
+                phase = getattr(self, phase_attr)
+                for i, bid in enumerate(store):
+                    lit = (i + phase) % 5 == 0
+                    canvas.itemconfig(bid, fill=NEON_PINK if lit else GOLD)
+                setattr(self, phase_attr, (phase + 1) % n)
+        if self._bottom_bulb_ids:
+            n = len(self._bottom_bulb_ids)
+            phase = (self._bulb_phase + n // 2) % n
+            for i, bid in enumerate(self._bottom_bulb_ids):
+                lit = (i + phase) % 5 == 0
+                self._bottom_bulb_canvas.itemconfig(bid, fill=NEON_CYAN if lit else GOLD)
+        self.after(110, self._chase_bulbs)
 
 
 # ---------------------------------------------------------------------------
@@ -368,8 +443,9 @@ class PlayerRow(ttk.Frame):
 
         tribe, colors, count = self.result
         guild = identity_name(colors)
+        swatch = identity_color(colors)
         ttk.Label(self.result_frame, text=tribe, style="Tribe.TLabel").pack(side="left", padx=(0, 6))
-        guild_badge = tk.Label(self.result_frame, text=f" {guild} ", fg="#0A0A0F", bg=GOLD,
+        guild_badge = tk.Label(self.result_frame, text=f" {guild} ", fg=REEL_DARK_TEXT, bg=swatch,
                                 font=("Segoe UI", 9, "bold"))
         guild_badge.pack(side="left", padx=(0, 8))
         badge = tk.Label(self.result_frame, text=f" {count} commanders ",
@@ -419,8 +495,8 @@ class WheelOfTribesApp:
         self.root = root
         self.root.title("Wheel of Tribes \u2660 Vegas Edition")
         self.root.configure(bg=BG_VOID)
-        self.root.geometry("780x800")
-        self.root.minsize(660, 620)
+        self.root.geometry("820x840")
+        self.root.minsize(700, 660)
 
         self.players = []
         self.player_id_seq = 1
@@ -448,6 +524,7 @@ class WheelOfTribesApp:
 
         style.configure("TFrame", background=BG_VOID)
         style.configure("Card.TFrame", background=BG_CARD)
+        style.configure("Cabinet.TFrame", background=BG_VOID)
         style.configure("TLabel", background=BG_VOID, foreground=PARCHMENT, font=("Segoe UI", 10))
         style.configure("Title.TLabel", background=BG_VOID, foreground=GOLD_BRIGHT,
                          font=("Impact", 30))
@@ -457,6 +534,9 @@ class WheelOfTribesApp:
                          font=("Georgia", 16, "bold"))
         style.configure("StageResult.TLabel", background=BG_VOID, foreground=PARCHMENT_DIM,
                          font=("Segoe UI", 10))
+        style.configure("ReelLabel.TLabel", background=BG_VOID, foreground=GOLD,
+                         font=("Segoe UI", 9, "bold"))
+        style.configure("Arrow.TLabel", background=BG_VOID, foreground=NEON_CYAN, font=("Segoe UI", 14, "bold"))
         style.configure("Dim.TLabel", background=BG_CARD, foreground=PARCHMENT_DIM)
         style.configure("Tribe.TLabel", background=BG_CARD, foreground=PARCHMENT,
                          font=("Segoe UI", 11, "bold"))
@@ -500,11 +580,11 @@ class WheelOfTribesApp:
 
         stage = ttk.Frame(wrap)
         stage.pack(pady=(0, 20))
-        self.wheel = WheelCanvas(stage)
-        self.wheel.pack()
+        self.slot_machine = SlotMachine(stage)
+        self.slot_machine.pack()
 
         self.stage_name = ttk.Label(stage, text="Take a seat and place your roll", style="StageName.TLabel")
-        self.stage_name.pack(pady=(10, 2))
+        self.stage_name.pack(pady=(14, 2))
         self.stage_result = ttk.Label(stage, text="", style="StageResult.TLabel")
         self.stage_result.pack()
 
@@ -581,33 +661,53 @@ class WheelOfTribesApp:
         thread = threading.Thread(target=roll_worker, args=(player_id, self.result_queue), daemon=True)
         thread.start()
 
+    # -- reel spin control -------------------------------------------------
+
     def _start_indefinite_spin(self):
         self._spinning = True
+
+        tribe_spin_items = [(t, None) for t in random.sample(TRIBES, min(30, len(TRIBES)))]
+        identity_spin_items = [(name, color) for name, color in ALL_IDENTITIES]
+        random.shuffle(identity_spin_items)
+
+        self.slot_machine.tribe_reel.set_strip(tribe_spin_items, cyclic=True)
+        self.slot_machine.tribe_reel.set_scroll(0)
+        self.slot_machine.identity_reel.set_strip(identity_spin_items, cyclic=True)
+        self.slot_machine.identity_reel.set_scroll(0)
+
+        self._tribe_scroll = 0.0
+        self._identity_scroll = 0.0
         self._spin_tick()
 
     def _spin_tick(self):
         if not self._spinning:
             return
-        self.wheel.set_rotation(self.wheel.rotation + 14)
-        self.root.after(40, self._spin_tick)
+        self._tribe_scroll += 22
+        self._identity_scroll += 16
+        self.slot_machine.tribe_reel.set_scroll(self._tribe_scroll)
+        self.slot_machine.identity_reel.set_scroll(self._identity_scroll)
+        self.root.after(35, self._spin_tick)
 
     def _stop_indefinite_spin(self):
         self._spinning = False
 
-    def _land_wheel_on(self, tribe, on_done):
-        n = len(TRIBES)
-        idx = TRIBES.index(tribe)
-        seg = 360 / n
-        seg_center = idx * seg + seg / 2
-        current = self.wheel.rotation % 360
+    def _land_reel(self, reel, target_text, target_bg, on_done, duration_ms):
+        row_h = SlotReel.ROW_H
+        padding = [(random.choice(TRIBES) if target_bg is None else random.choice(ALL_IDENTITIES)[0], None)
+                   for _ in range(2)]
+        lead_in = []
+        if target_bg is None:
+            lead_in = [(random.choice(TRIBES), None) for _ in range(16)]
+        else:
+            lead_in = [random.choice(ALL_IDENTITIES) for _ in range(16)]
 
-        target_static = (90 - seg_center) % 360
-        delta = (target_static - current) % 360
-        extra_spins = 5 * 360
-        total_delta = extra_spins + delta
+        strip = lead_in + [(target_text, target_bg)] + padding
+        target_index = len(lead_in)
+        scroll_final = (target_index - 1) * row_h
 
-        start_rot = self.wheel.rotation
-        duration_ms = 3200
+        reel.set_strip(strip, cyclic=False)
+        reel.set_scroll(0)
+
         start_time = time.time()
 
         def ease_out_cubic(t):
@@ -617,13 +717,30 @@ class WheelOfTribesApp:
             elapsed = (time.time() - start_time) * 1000
             t = min(1.0, elapsed / duration_ms)
             eased = ease_out_cubic(t)
-            self.wheel.set_rotation(start_rot + total_delta * eased)
+            reel.set_scroll(scroll_final * eased)
             if t < 1.0:
                 self.root.after(16, frame)
             else:
                 on_done()
 
         frame()
+
+    def _land_slot_on(self, tribe, colors, on_done):
+        swatch = identity_color(colors)
+        guild = identity_name(colors)
+
+        state = {"done": 0}
+
+        def piece_done():
+            state["done"] += 1
+            if state["done"] == 2:
+                on_done()
+
+        # cascading stop, like a real slot machine: tribe reel stops first
+        self._land_reel(self.slot_machine.tribe_reel, tribe, None, piece_done, duration_ms=2400)
+        self.root.after(350, lambda: self._land_reel(
+            self.slot_machine.identity_reel, guild, swatch, piece_done, duration_ms=2600
+        ))
 
     def _flash_jackpot(self, times_left=8):
         colors = [GOLD_BRIGHT, NEON_PINK]
@@ -662,7 +779,7 @@ class WheelOfTribesApp:
                             self._flash_jackpot()
                         self._finish_roll()
 
-                    self._land_wheel_on(tribe, on_landed)
+                    self._land_slot_on(tribe, colors, on_landed)
 
                 elif kind == "timeout":
                     self._stop_indefinite_spin()
@@ -670,7 +787,7 @@ class WheelOfTribesApp:
                     if row:
                         row.set_timeout()
                         self.stage_name.config(text=f"House wins \u2014 no hit for {row.name}", foreground=GOLD_BRIGHT)
-                        self.stage_result.config(text="The wheel ran out of time. Pull again.")
+                        self.stage_result.config(text="The reels ran out of time. Pull again.")
                     self._finish_roll()
 
         except queue.Empty:
